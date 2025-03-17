@@ -5,8 +5,10 @@ use std::fs;
 // Add this to import the daily_logs module and its commands.
 mod daily_logs;
 mod gui; // <-- new GUI module
+mod login; // new login module
 use daily_logs::{DailyLogs, daily_logs_menu};
 use gui::launch_gui;
+use login::login_page;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct BasicFood {
@@ -161,6 +163,9 @@ fn ensure_basic_food_exists(db: &mut FoodDatabase, id: &str) -> String {
 }
 
 fn main() {
+    // First, ask user to login or signup.
+    let user = login_page();
+
     // Load food database.
     let db_file = "food_database.json";
     let mut db = FoodDatabase::load_from_file(db_file);
@@ -204,7 +209,7 @@ fn main() {
                     }
                 }
             },
-            "2" => daily_logs_menu(&mut dlogs, &db), // Pass &db as second argument.
+            "2" => daily_logs_menu(&mut dlogs, &db, &user), // Pass &db as second argument.
             "3" => {
                 match db.save_to_file(db_file) {
                     Ok(_) => println!("Food database saved successfully."),
