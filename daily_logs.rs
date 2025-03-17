@@ -12,11 +12,22 @@ pub struct LogEntry {
     pub servings: f32,
 }
 
+/// User's daily metrics that can change each day
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct DailyUserInfo {
+    pub age: u32,
+    pub weight: f32,
+    pub activity_level: String,
+}
+
 /// Represents the log for a specific day.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct DailyLog {
-    pub date: String, // Format "YYYY-MM-DD"
+    pub date: String, // "YYYY-MM-DD"
+    #[serde(default)]   // NEW: if missing, default to empty string
+    pub username: String, // owner of this log
     pub entries: Vec<LogEntry>,
+    pub daily_info: Option<DailyUserInfo>,  // NEW: daily metrics
 }
 
 /// The various command actions that can be undone.
@@ -63,19 +74,68 @@ impl DailyLogs {
         fs::write(file_path, data)
     }
 
-    /// Get a mutable reference to the log for the given date.
-    /// If no log exists for that date, a new one is created.
-    pub fn get_log_mut(&mut self, date: &str) -> &mut DailyLog {
-        self.logs.entry(date.to_string()).or_insert(DailyLog {
-            date: date.to_string(),
-            entries: Vec::new(),
-        })
+    /// Helper: Get previous day's metrics for the given user if available.
+    fn get_previous_daily_info(&self, username: &str, date: &str) -> Option<DailyUserInfo> {
+        // Try to parse the current date
+        let curr_date = NaiveDate::parse_from_str(date, "%Y-%m-%d").ok()?;
+        
+        // Collect all previous logs for this user with valid dates
+        let mut prior_infos: Vec<(NaiveDate, DailyUserInfo)> = Vec::new();
+        
+        for (key, log) in &self.logs {
+            // Only consider logs for this user
+            if log.username.eq_ignore_ascii_case(username) {
+                if let Ok(log_date) = NaiveDate::parse_from_str(&log.date, "%Y-%m-%d") {
+                    // Only consider dates before current date
+                    if log_date < curr_date {
+                        // If this log has daily info, add it to our collection
+                        if let Some(info) = &log.daily_info {
+                            prior_infos.push((log_date, info.clone()));
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Sort by date descending, most recent first
+        prior_infos.sort_by(|a, b| b.0.cmp(&a.0));
+        
+        // Return the most recent info if available
+        prior_infos.first().map(|(_, info)| info.clone())
     }
 
-    /// List all entries for a specified date.
-    pub fn list_entries(&self, date: &str) {
-        if let Some(log) = self.logs.get(date) {
+    /// Get a mutable reference to the log for the given date and user.
+    /// If no log exists for that date for this user, a new one is created.
+    pub fn get_log_mut_for_user(&mut self, date: &str, username: &str) -> &mut DailyLog {
+        let key = format!("{}:{}", username, date);
+        
+        // If the log doesn't exist, we'll need to get previous day info
+        if !self.logs.contains_key(&key) {
+            let prev_info = self.get_previous_daily_info(username, date);
+            
+            self.logs.insert(key.clone(), DailyLog {
+                date: date.to_string(),
+                username: username.to_string(),
+                entries: Vec::new(),
+                daily_info: prev_info,
+            });
+        }
+        
+        self.logs.get_mut(&key).unwrap()
+    }
+
+    /// List all entries for a specified date and user.
+    pub fn list_entries_for_user(&self, date: &str, username: &str) {
+        let key = format!("{}:{}", username, date);
+        if let Some(log) = self.logs.get(&key) {
             println!("Daily Log for {}:", date);
+            
+            // Show daily metrics if available
+            if let Some(info) = &log.daily_info {
+                println!("  Daily Metrics - Age: {}, Weight: {} kg, Activity Level: {}", 
+                         info.age, info.weight, info.activity_level);
+            }
+            
             for (i, entry) in log.entries.iter().enumerate() {
                 println!("  {}: Food: {}, Servings: {}", i, entry.food_id, entry.servings);
             }
@@ -86,49 +146,38 @@ impl DailyLogs {
 
     /// Add an entry to the log for the specified date and record the action for undo.
     /// If a food with the same ID already exists in the log, it adds the servings instead of creating a new entry.
-    pub fn add_entry(&mut self, date: &str, entry: LogEntry) {
-        // First, check if the food already exists and prepare data
-        let (needs_update, existing_idx, old_entry) = if let Some(log) = self.logs.get(date) {
-            // Check if the food already exists in the log
+    pub fn add_entry(&mut self, key: &str, entry: LogEntry) {
+        let (needs_update, existing_idx, old_entry) = if let Some(log) = self.logs.get(key) {
             if let Some(idx) = log.entries.iter().position(|e| e.food_id == entry.food_id) {
-                // Food already exists
                 let old = log.entries[idx].clone();
                 (true, idx, old)
             } else {
-                (false, 0, entry.clone()) // No existing entry
+                (false, 0, entry.clone())
             }
         } else {
-            (false, 0, entry.clone()) // No log for this date
+            (false, 0, entry.clone())
         };
 
         if needs_update {
-            // Update existing entry
             let new_servings = old_entry.servings + entry.servings;
             let new_entry = LogEntry {
                 food_id: old_entry.food_id.clone(),
                 servings: new_servings,
             };
-            
-            // Get the log mut and update the entry
-            let log = self.get_log_mut(date);
+            let log = self.get_log_mut_generic(key);
             log.entries[existing_idx] = new_entry.clone();
-            
-            // Record the update in the undo stack
             self.undo_stack.push(LogCommand::UpdateEntry {
-                date: date.to_string(),
+                date: key.to_string(),
                 old_entry,
                 new_entry,
                 index: existing_idx,
             });
             println!("Added servings to existing food entry.");
         } else {
-            // Add new food entry
-            let log = self.get_log_mut(date);
+            let log = self.get_log_mut_generic(key);
             log.entries.push(entry.clone());
-            
-            // Record the add in the undo stack
             self.undo_stack.push(LogCommand::AddEntry {
-                date: date.to_string(),
+                date: key.to_string(),
                 entry,
             });
             println!("Entry added.");
@@ -136,33 +185,42 @@ impl DailyLogs {
     }
 
     /// Delete the entry at the given index from the log for the specified date and record the action for undo.
-    pub fn delete_entry(&mut self, date: &str, index: usize) {
-        if let Some(log) = self.logs.get_mut(date) {
+    pub fn delete_entry(&mut self, key: &str, index: usize) {
+        if let Some(log) = self.logs.get_mut(key) {
             if index < log.entries.len() {
                 let entry = log.entries.remove(index);
-                self.undo_stack.push(LogCommand::DeleteEntry { date: date.to_string(), entry, index });
+                self.undo_stack.push(LogCommand::DeleteEntry {
+                    date: key.to_string(),
+                    entry,
+                    index,
+                });
                 println!("Entry deleted.");
             } else {
                 println!("Invalid index.");
             }
         } else {
-            println!("No log for date {}.", date);
+            println!("No log for key {}.", key);
         }
     }
 
     /// Update the entry at the given index for the specified date with a new entry, and record the change for undo.
-    pub fn update_entry(&mut self, date: &str, index: usize, new_entry: LogEntry) {
-        if let Some(log) = self.logs.get_mut(date) {
+    pub fn update_entry(&mut self, key: &str, index: usize, new_entry: LogEntry) {
+        if let Some(log) = self.logs.get_mut(key) {
             if index < log.entries.len() {
                 let old_entry = log.entries[index].clone();
                 log.entries[index] = new_entry.clone();
-                self.undo_stack.push(LogCommand::UpdateEntry { date: date.to_string(), old_entry, new_entry, index });
+                self.undo_stack.push(LogCommand::UpdateEntry {
+                    date: key.to_string(),
+                    old_entry,
+                    new_entry,
+                    index,
+                });
                 println!("Entry updated.");
             } else {
                 println!("Invalid index.");
             }
         } else {
-            println!("No log for date {}.", date);
+            println!("No log for key {}.", key);
         }
     }
 
@@ -179,7 +237,8 @@ impl DailyLogs {
                     }
                 },
                 LogCommand::DeleteEntry { date, entry, index } => {
-                    let log = self.get_log_mut(&date);
+                    // Changed from get_log_mut to get_log_mut_generic
+                    let log = self.get_log_mut_generic(&date);
                     if index <= log.entries.len() {
                         log.entries.insert(index, entry);
                         println!("Undo: Reinserted deleted entry.");
@@ -197,6 +256,15 @@ impl DailyLogs {
         } else {
             println!("No commands to undo.");
         }
+    }
+
+    fn get_log_mut_generic(&mut self, key: &str) -> &mut DailyLog {
+        self.logs.entry(key.to_string()).or_insert(DailyLog {
+            date: key.split(':').nth(1).unwrap_or("").to_string(),
+            username: key.split(':').nth(0).unwrap_or("").to_string(),
+            entries: Vec::new(),
+            daily_info: None,
+        })
     }
 }
 
@@ -318,10 +386,10 @@ pub fn choose_food(db: &FoodDatabase) -> Option<String> {
 }
 
 /// Presents a menu for daily logs operations for a selected date.
-pub fn daily_logs_menu(dlogs: &mut DailyLogs, db: &FoodDatabase) {
+pub fn daily_logs_menu(dlogs: &mut DailyLogs, db: &FoodDatabase, user: &crate::login::User) {
     loop {
         println!("\nDaily Logs Menu:");
-        println!("Enter a date (YYYY-MM-DD) to select its log, or type 'back' to return:");
+        println!("Enter a date (YYYY-MM-DD) to select its log for user '{}', or type 'back' to return:", user.username);
         let mut date = String::new();
         io::stdin().read_line(&mut date).unwrap();
         let date = date.trim();
@@ -341,16 +409,18 @@ pub fn daily_logs_menu(dlogs: &mut DailyLogs, db: &FoodDatabase) {
             println!("3. Delete entry");
             println!("4. Update entry");
             println!("5. Undo last command");
-            println!("6. Back to date selection");
-            println!("7. Return to Main Menu");  // New option.
+            println!("6. Update Daily Metrics");  // NEW: option to update metrics
+            println!("7. Back to date selection");
+            println!("8. Return to Main Menu");  // New option.
             print!("Enter choice: ");
             io::stdout().flush().unwrap();
             let mut choice = String::new();
             io::stdin().read_line(&mut choice).unwrap();
             match choice.trim() {
-                "1" => dlogs.list_entries(date),
+                "1" => {
+                    DailyLogs::list_entries_for_user(dlogs, date, &user.username);
+                },
                 "2" => {
-                    // New add entry: select food from FoodDatabase.
                     if let Some(food_id) = choose_food(db) {
                         print!("Enter number of servings: ");
                         io::stdout().flush().unwrap();
@@ -358,7 +428,13 @@ pub fn daily_logs_menu(dlogs: &mut DailyLogs, db: &FoodDatabase) {
                         io::stdin().read_line(&mut servings_str).unwrap();
                         if let Ok(servings) = servings_str.trim().parse::<f32>() {
                             let entry = LogEntry { food_id, servings };
-                            dlogs.add_entry(date, entry);
+                            let log = dlogs.get_log_mut_for_user(date, &user.username);
+                            log.entries.push(entry.clone());
+                            dlogs.undo_stack.push(LogCommand::AddEntry {
+                                date: format!("{}:{}", user.username, date),
+                                entry,
+                            });
+                            println!("Entry added.");
                         } else {
                             println!("Invalid servings input.");
                         }
@@ -369,7 +445,7 @@ pub fn daily_logs_menu(dlogs: &mut DailyLogs, db: &FoodDatabase) {
                     println!("Enter entry index to delete:");
                     io::stdin().read_line(&mut index_str).unwrap();
                     if let Ok(index) = index_str.trim().parse::<usize>() {
-                        dlogs.delete_entry(date, index);
+                        dlogs.delete_entry(&format!("{}:{}", user.username, date), index);
                     } else {
                         println!("Invalid index input.");
                     }
@@ -384,11 +460,11 @@ pub fn daily_logs_menu(dlogs: &mut DailyLogs, db: &FoodDatabase) {
                         io::stdout().flush().unwrap();
                         io::stdin().read_line(&mut new_servings_str).unwrap();
                         if let Ok(new_servings) = new_servings_str.trim().parse::<f32>() {
-                            if let Some(log) = dlogs.logs.get(date) {
+                            if let Some(log) = dlogs.logs.get(&format!("{}:{}", user.username, date)) {
                                 if index < log.entries.len() {
                                     let old_entry = log.entries[index].clone();
                                     let new_entry = LogEntry { food_id: old_entry.food_id.clone(), servings: new_servings };
-                                    dlogs.update_entry(date, index, new_entry);
+                                    dlogs.update_entry(&format!("{}:{}", user.username, date), index, new_entry);
                                 } else {
                                     println!("Invalid index.");
                                 }
@@ -403,8 +479,67 @@ pub fn daily_logs_menu(dlogs: &mut DailyLogs, db: &FoodDatabase) {
                     }
                 },
                 "5" => dlogs.undo_last(),
-                "6" => break,
-                "7" => return, // Direct return to main menu.
+                "6" => {
+                    // NEW: Update daily metrics
+                    let log = dlogs.get_log_mut_for_user(date, &user.username);
+                    
+                    println!("Current Daily Metrics:");
+                    if let Some(info) = &log.daily_info {
+                        println!("Age: {}, Weight: {} kg, Activity Level: {}", 
+                                 info.age, info.weight, info.activity_level);
+                    } else {
+                        println!("No metrics set yet. Using account defaults.");
+                    }
+                    
+                    // Determine default values - use current metrics, previous day's metrics, or account info
+                    let default_age = log.daily_info.as_ref().map_or(user.age, |info| info.age);
+                    let default_weight = log.daily_info.as_ref().map_or(user.weight, |info| info.weight);
+                    let default_activity = log.daily_info.as_ref().map_or(user.activity_level.clone(), |info| info.activity_level.clone());
+                    
+                    // Age input (optional, press Enter to keep default)
+                    print!("Enter age [{}]: ", default_age);
+                    io::stdout().flush().unwrap();
+                    let mut age_input = String::new();
+                    io::stdin().read_line(&mut age_input).unwrap();
+                    let age = if age_input.trim().is_empty() {
+                        default_age
+                    } else {
+                        age_input.trim().parse().unwrap_or(default_age)
+                    };
+                    
+                    // Weight input (optional, press Enter to keep default)
+                    print!("Enter weight in kg [{}]: ", default_weight);
+                    io::stdout().flush().unwrap();
+                    let mut weight_input = String::new();
+                    io::stdin().read_line(&mut weight_input).unwrap();
+                    let weight = if weight_input.trim().is_empty() {
+                        default_weight
+                    } else {
+                        weight_input.trim().parse().unwrap_or(default_weight)
+                    };
+                    
+                    // Activity level input (optional, press Enter to keep default)
+                    print!("Enter activity level (low/moderate/high) [{}]: ", default_activity);
+                    io::stdout().flush().unwrap();
+                    let mut activity_input = String::new();
+                    io::stdin().read_line(&mut activity_input).unwrap();
+                    let activity_level = if activity_input.trim().is_empty() {
+                        default_activity
+                    } else {
+                        activity_input.trim().to_string()
+                    };
+                    
+                    // Update the daily metrics
+                    log.daily_info = Some(DailyUserInfo {
+                        age,
+                        weight,
+                        activity_level,
+                    });
+                    
+                    println!("Daily metrics updated successfully.");
+                },
+                "7" => break,
+                "8" => return, // Direct return to main menu.
                 _ => println!("Invalid choice."),
             }
         }
