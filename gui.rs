@@ -274,6 +274,18 @@ impl MyApp {
                         if is_selected {
                             ui.add_space(8.0);
                             ui.separator();
+                            
+                            // Display daily metrics if available
+                            if let Some(info) = &log.daily_info {
+                                ui.horizontal(|ui| {
+                                    ui.label(RichText::new("Daily Metrics:").strong());
+                                    ui.label(RichText::new(format!(
+                                        "Age: {}, Weight: {} kg, Activity: {}", 
+                                        info.age, info.weight, info.activity_level
+                                    )).color(self.colors.text_secondary));
+                                });
+                                ui.add_space(4.0);
+                            }
 
                             if entries_empty {
                                 ui.label(RichText::new("No entries for this day")
