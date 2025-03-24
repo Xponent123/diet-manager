@@ -1,12 +1,13 @@
-use serde::{Serialize, Deserialize};
+use serde::{Serialize, Deserialize}; 
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, Write};
 use chrono::NaiveDate;
-use crate::{FoodDatabase}; // import FoodDatabase from main.rs
+use crate::FoodDatabase; // import FoodDatabase from main.rs
+use crate::calorie_calculator::{CalorieMethod, calculate_calorie_target};
 
 /// Represents a single food consumption log entry.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)] 
 pub struct LogEntry {
     pub food_id: String,
     pub servings: f32,
@@ -18,6 +19,8 @@ pub struct DailyUserInfo {
     pub age: u32,
     pub weight: f32,
     pub activity_level: String,
+    #[serde(default)]  // Default to MifflinStJeor if missing
+    pub calorie_method: CalorieMethod,
 }
 
 /// Represents the log for a specific day.
@@ -82,7 +85,8 @@ impl DailyLogs {
         // Collect all previous logs for this user with valid dates
         let mut prior_infos: Vec<(NaiveDate, DailyUserInfo)> = Vec::new();
         
-        for (key, log) in &self.logs {
+        // Fix unused variable warning
+        for (_key, log) in &self.logs {
             // Only consider logs for this user
             if log.username.eq_ignore_ascii_case(username) {
                 if let Ok(log_date) = NaiveDate::parse_from_str(&log.date, "%Y-%m-%d") {
@@ -269,7 +273,7 @@ impl DailyLogs {
 }
 
 // Add a helper function to validate date format.
-fn validate_date(date: &str) -> bool {
+pub fn validate_date(date: &str) -> bool {
     NaiveDate::parse_from_str(date, "%Y-%m-%d").is_ok()
 }
 
@@ -403,17 +407,70 @@ pub fn daily_logs_menu(dlogs: &mut DailyLogs, db: &FoodDatabase, user: &crate::l
         }
         // Once a date is selected, enter the submenu for that day's log.
         loop {
-            println!("\nDaily Log for {}:", date);
+            // Calculate daily calories consumed vs target
+            let key = format!("{}:{}", user.username, date);
+            let daily_calories = if let Some(log) = dlogs.logs.get(&key) {
+                log.entries.iter()
+                    .map(|entry| db.calculate_food_calories(&entry.food_id, entry.servings))
+                    .sum::<u32>()
+            } else {
+                0
+            };
+            
+            // Calculate target calories based on user info and chosen method
+            let target_calories = if let Some(log) = dlogs.logs.get(&key) {
+                if let Some(info) = &log.daily_info {
+                    calculate_calorie_target(
+                        &info.calorie_method,
+                        &user.gender,
+                        info.weight,
+                        user.height,
+                        info.age,
+                        &info.activity_level
+                    )
+                } else {
+                    calculate_calorie_target(
+                        &CalorieMethod::default(),
+                        &user.gender,
+                        user.weight,
+                        user.height,
+                        user.age,
+                        &user.activity_level
+                    )
+                }
+            } else {
+                calculate_calorie_target(
+                    &CalorieMethod::default(),
+                    &user.gender,
+                    user.weight,
+                    user.height,
+                    user.age,
+                    &user.activity_level
+                )
+            };
+            
+            let calorie_balance = daily_calories as i32 - target_calories as i32;
+            let balance_str = if calorie_balance <= 0 {
+                format!("{} calories remaining", -calorie_balance)
+            } else {
+                format!("{} calories over target", calorie_balance)
+            };
+            
+            println!("\nDaily Log for {}: {} of {} target calories ({})", 
+                     date, daily_calories, target_calories, balance_str);
+            
             println!("1. List entries");
             println!("2. Add entry");
             println!("3. Delete entry");
             println!("4. Update entry");
             println!("5. Undo last command");
-            println!("6. Update Daily Metrics");  // NEW: option to update metrics
+            println!("6. Update Daily Metrics");
+            // Remove option 7 (Change Calorie Calculation Method) as it's now in the User Menu
             println!("7. Back to date selection");
-            println!("8. Return to Main Menu");  // New option.
+            println!("8. Return to User Menu");  // Changed from "Return to Main Menu"
             print!("Enter choice: ");
             io::stdout().flush().unwrap();
+            
             let mut choice = String::new();
             io::stdin().read_line(&mut choice).unwrap();
             match choice.trim() {
@@ -534,12 +591,13 @@ pub fn daily_logs_menu(dlogs: &mut DailyLogs, db: &FoodDatabase, user: &crate::l
                         age,
                         weight,
                         activity_level,
+                        calorie_method: log.daily_info.as_ref().map_or(CalorieMethod::default(), |info| info.calorie_method.clone()),
                     });
                     
                     println!("Daily metrics updated successfully.");
                 },
                 "7" => break,
-                "8" => return, // Direct return to main menu.
+                "8" => return, // Return to User Menu
                 _ => println!("Invalid choice."),
             }
         }
