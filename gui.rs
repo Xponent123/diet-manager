@@ -1,7 +1,10 @@
 use eframe::egui;
 use egui::{FontId, FontFamily, RichText, Color32};
-use egui::plot::{Line, Plot, PlotPoints};
+use egui::plot::PlotPoints;
 use crate::{FoodDatabase, DailyLogs};
+use crate::calorie_calculator::calculate_calorie_target;
+use crate::login::User;
+use eframe::egui::{CentralPanel, SidePanel};
 
 // Define sophisticated color palette with hex codes
 struct AppColors {
@@ -41,24 +44,31 @@ impl AppColors {
     }
 }
 
+#[derive(PartialEq)]
+pub enum Tab {
+    FoodDatabase,
+    DailyLogs,
+    Insights,
+}
+
 pub struct MyApp {
     pub food_db: FoodDatabase,
     pub dlogs: DailyLogs,
-    pub tab: usize, // 0 = Food, 1 = Daily Logs, 2 = Insights
     pub food_search: String,
- 
+    pub current_user: User,  // NEW: Add current user to the app
+    pub selected_tab: Tab,  // NEW: store which tab is active
     colors: AppColors,
     pub selected_date: Option<String>,
 }
 
 impl MyApp {
-    pub fn new(food_db: FoodDatabase, dlogs: DailyLogs) -> Self {
+    pub fn new(food_db: FoodDatabase, dlogs: DailyLogs, user: User) -> Self {  // Updated to include user
         Self { 
             food_db, 
             dlogs, 
-            tab: 0, 
             food_search: String::new(),
-            
+            current_user: user,  // Store the user
+            selected_tab: Tab::FoodDatabase,
             colors: AppColors::new(),
             selected_date: None,
         }
@@ -79,21 +89,7 @@ impl MyApp {
     }
 
     /// Build data for the Insights plot from daily logs.
-    fn insights_plot_data(&self) -> PlotPoints {
-        // ...existing implementation...
-        let mut points = Vec::new();
-        let mut dates: Vec<_> = self.dlogs.logs.keys().cloned().collect();
-        dates.sort();
-        for (i, date) in dates.iter().enumerate() {
-            if let Some(log) = self.dlogs.logs.get(date) {
-                let total: u32 = log.entries.iter()
-                    .map(|e| self.calculate_food_calories(&e.food_id, e.servings))
-                    .sum();
-                points.push([i as f64, total as f64]);
-            }
-        }
-        PlotPoints::from(points)
-    }
+   
     
     // Helper to create styled headers
     fn h1(&self, ui: &mut egui::Ui, text: &str) {
@@ -220,13 +216,25 @@ impl MyApp {
     }
     
     fn render_daily_logs(&mut self, ui: &mut egui::Ui) {
-        self.h1(ui, "Daily Food Logs");
+        self.h1(ui, &format!("Daily Food Logs for {}", self.current_user.username));
         
         if self.dlogs.logs.is_empty() {
             ui.label(RichText::new("No food logs recorded yet").color(self.colors.text_muted).italics());
         } else {
             egui::ScrollArea::vertical().id_source("daily_logs_scroll").show(ui, |ui| {
-                let mut dates: Vec<String> = self.dlogs.logs.keys().cloned().collect();
+                // Filter logs by current user
+                let mut dates: Vec<String> = self.dlogs.logs.keys()
+                    .filter(|k| k.starts_with(&format!("{}:", self.current_user.username)))
+                    .cloned()
+                    .collect();
+                
+                // If no logs found for current user
+                if dates.is_empty() {
+                    ui.label(RichText::new(format!("No logs found for user {}", self.current_user.username))
+                        .color(self.colors.text_muted).italics());
+                    return;
+                }
+                
                 dates.sort();
                 dates.reverse(); // Most recent first
                 
@@ -234,9 +242,43 @@ impl MyApp {
                     // Extract all needed data before closure
                     let log = self.dlogs.logs.get(&date).unwrap();
                     let entries_empty = log.entries.is_empty();
+                    
+                    // Calculate consumed calories
                     let total_cal: u32 = log.entries.iter()
                         .map(|entry| self.calculate_food_calories(&entry.food_id, entry.servings))
                         .sum();
+                    
+                    // Extract just the date part for display
+                    let display_date = date.split(':').nth(1).unwrap_or(&date);
+                    
+                    // Calculate target calories using user's preferred method
+                    let target_cal = if let Some(info) = &log.daily_info {
+                        calculate_calorie_target(
+                            &info.calorie_method,
+                            &self.current_user.gender,
+                            info.weight,
+                            self.current_user.height,
+                            info.age,
+                            &info.activity_level
+                        )
+                    } else {
+                        calculate_calorie_target(
+                            &crate::calorie_calculator::CalorieMethod::default(),
+                            &self.current_user.gender,
+                            self.current_user.weight,
+                            self.current_user.height,
+                            self.current_user.age,
+                            &self.current_user.activity_level
+                        )
+                    };
+                    
+                    let calorie_balance = total_cal as i32 - target_cal as i32;
+                    let balance_color = if calorie_balance <= 0 {
+                        self.colors.primary // under target - good
+                    } else {
+                        self.colors.accent // over target - warning
+                    };
+                    
                     let entry_data: Vec<(String, f32, u32)> = log.entries.iter()
                         .map(|e| (
                             e.food_id.clone(),
@@ -245,7 +287,7 @@ impl MyApp {
                         ))
                         .collect();
                     let is_selected = self.selected_date.as_ref().map_or(false, |d| d == &date);
-                    let header_text = format!("{} ({} items, {} calories)", date, log.entries.len(), total_cal);
+                    let header_text = format!("{} ({} items)", display_date, log.entries.len());
                     let date_clone = date.clone();
                     let header = if is_selected {
                         RichText::new(header_text)
@@ -265,17 +307,33 @@ impl MyApp {
                             if ui.add(egui::Label::new(header).sense(egui::Sense::click())).clicked() {
                                 card_clicked = true;
                             }
-                            let progress_percent = (total_cal as f32 / 2000.0).min(1.0);
+                            
+                            // Show calories with target
+                            let balance_text = if calorie_balance <= 0 {
+                                format!("{} / {} cal ({} remaining)", total_cal, target_cal, -calorie_balance)
+                            } else {
+                                format!("{} / {} cal ({} over)", total_cal, target_cal, calorie_balance)
+                            };
+                            
+                            // Progress bar - removed the .fill() method which is not supported in this version
+                            let progress_percent = (total_cal as f32 / target_cal as f32).min(1.0);
                             ui.add(egui::ProgressBar::new(progress_percent)
-                                .text(format!("{} / 2000 cal", total_cal))
+                                .text(balance_text)
                             );
+                            
+                            // Add a colored indicator next to the progress bar instead
+                            if calorie_balance <= 0 {
+                                ui.colored_label(self.colors.primary, "✓");
+                            } else {
+                                ui.colored_label(self.colors.accent, "!");
+                            }
                         });
 
                         if is_selected {
                             ui.add_space(8.0);
                             ui.separator();
                             
-                            // Display daily metrics if available
+                            // Display daily metrics and calorie balance
                             if let Some(info) = &log.daily_info {
                                 ui.horizontal(|ui| {
                                     ui.label(RichText::new("Daily Metrics:").strong());
@@ -283,6 +341,20 @@ impl MyApp {
                                         "Age: {}, Weight: {} kg, Activity: {}", 
                                         info.age, info.weight, info.activity_level
                                     )).color(self.colors.text_secondary));
+                                });
+                                ui.horizontal(|ui| {
+                                    ui.label(RichText::new("Calorie Method:").strong());
+                                    ui.label(RichText::new(info.calorie_method.name())
+                                        .color(self.colors.text_secondary));
+                                });
+                                ui.horizontal(|ui| {
+                                    ui.label(RichText::new("Calorie Status:").strong());
+                                    let status_text = if calorie_balance <= 0 {
+                                        format!("{} calories remaining", -calorie_balance)
+                                    } else {
+                                        format!("{} calories over target", calorie_balance)
+                                    };
+                                    ui.label(RichText::new(status_text).color(balance_color));
                                 });
                                 ui.add_space(4.0);
                             }
@@ -325,98 +397,374 @@ impl MyApp {
     }
     
     fn render_insights(&mut self, ui: &mut egui::Ui) {
-        self.h1(ui, "Nutrition Insights");
+        self.h1(ui, &format!("Nutrition Insights for {}", self.current_user.username));
         
-        if self.dlogs.logs.is_empty() {
-            ui.label(RichText::new("Not enough data to generate insights").color(self.colors.text_muted).italics());
+        // Filter logs by current user
+        let user_logs: Vec<(&String, &crate::daily_logs::DailyLog)> = self.dlogs.logs.iter()
+            .filter(|(k, _)| k.starts_with(&format!("{}:", self.current_user.username)))
+            .collect();
+        
+        if user_logs.is_empty() {
+            ui.vertical_centered(|ui| {
+                ui.add_space(40.0);
+                ui.label(RichText::new("Not enough data to generate insights")
+                    .color(self.colors.text_muted)
+                    .size(20.0)
+                    .italics());
+                ui.add_space(10.0);
+                ui.label(RichText::new("Try adding some food entries to your daily logs")
+                    .color(self.colors.text_secondary));
+            });
             return;
         }
         
-        // Calculate daily average calories
+        // Calculate key metrics and statistics
         let mut total_calories = 0;
         let mut days_count = 0;
         let mut highest_day = (String::new(), 0);
+        let mut lowest_day = (String::new(), u32::MAX);
+        let mut calorie_data: Vec<(String, u32)> = Vec::new();
+        let mut avg_target = 0;
+        let mut days_over_target = 0;
         
-        for (date, log) in &self.dlogs.logs {
+        for (date, log) in &user_logs {
+            let display_date = date.split(':').nth(1).unwrap_or(date);
+            
+            // Calculate calories for this day
             let day_calories: u32 = log.entries.iter()
                 .map(|entry| self.calculate_food_calories(&entry.food_id, entry.servings))
                 .sum();
                 
             if day_calories > 0 {
+                // Track individual day data
+                calorie_data.push((display_date.to_string(), day_calories));
+                
+                // Update aggregate stats
                 total_calories += day_calories;
                 days_count += 1;
                 
+                // Calculate target calories for this log
+                let target_cal = if let Some(info) = &log.daily_info {
+                    let target = crate::calorie_calculator::calculate_calorie_target(
+                        &info.calorie_method,
+                        &self.current_user.gender,
+                        info.weight,
+                        self.current_user.height,
+                        info.age,
+                        &info.activity_level
+                    );
+                    avg_target += target;
+                    if day_calories > target {
+                        days_over_target += 1;
+                    }
+                    target
+                } else {
+                    2000 // Default if no info
+                };
+                
+                // Update highest and lowest days
                 if day_calories > highest_day.1 {
-                    highest_day = (date.clone(), day_calories);
+                    highest_day = (display_date.to_string(), day_calories);
+                }
+                
+                if day_calories < lowest_day.1 {
+                    lowest_day = (display_date.to_string(), day_calories);
                 }
             }
         }
         
         let avg_calories = if days_count > 0 { total_calories as f32 / days_count as f32 } else { 0.0 };
+        let avg_target = if days_count > 0 { avg_target as f32 / days_count as f32 } else { 2000.0 };
+        let target_achievement = if avg_target > 0.0 { avg_calories / avg_target } else { 0.0 };
         
-        // Summary stats
-        self.card_frame(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.vertical(|ui| {
-                    ui.label(RichText::new("Average Daily Calories").color(self.colors.text_secondary));
-                    ui.label(RichText::new(format!("{:.0}", avg_calories))
-                        .color(self.colors.text_primary)
-                        .font(FontId::new(24.0, FontFamily::Proportional))
-                        .strong()
-                    );
-                });
-                
-                ui.separator();
-                
-                ui.vertical(|ui| {
-                    ui.label(RichText::new("Days Tracked").color(self.colors.text_secondary));
-                    ui.label(RichText::new(format!("{}", days_count))
-                        .color(self.colors.text_primary)
-                        .font(FontId::new(24.0, FontFamily::Proportional))
-                        .strong()
-                    );
-                });
-                
-                ui.separator();
-                
-                ui.vertical(|ui| {
-                    ui.label(RichText::new("Highest Intake Day").color(self.colors.text_secondary));
-                    ui.label(RichText::new(format!("{} ({})", highest_day.0, highest_day.1))
-                        .color(self.colors.accent)
-                        .font(FontId::new(18.0, FontFamily::Proportional))
-                    );
-                });
+        // Sort calorie data by date for proper display
+        calorie_data.sort_by(|a, b| a.0.cmp(&b.0));
+        
+        // Calculate smoothed average trend for visualization
+        let mut trend_data = Vec::new();
+        let window_size = 3.min(calorie_data.len());
+        if window_size > 0 {
+            for i in 0..calorie_data.len() {
+                let start = i.saturating_sub(window_size / 2);
+                let end = (i + window_size / 2 + 1).min(calorie_data.len());
+                let window_sum: u32 = calorie_data[start..end].iter().map(|(_, cal)| cal).sum();
+                let window_avg = window_sum as f32 / (end - start) as f32;
+                trend_data.push((i as f64, window_avg as f64));
+            }
+        }
+        
+        // Create summary stats cards in a row
+        ui.horizontal(|ui| {
+            // Left Stats Group
+            ui.vertical(|ui| {
+                egui::Frame::none()
+                    .fill(self.colors.bg_light)
+                    .rounding(8.0)
+                    .inner_margin(egui::style::Margin::same(16.0))
+                    .show(ui, |ui| {
+                        ui.add_space(4.0);
+                        ui.label(RichText::new("CALORIC INTAKE")
+                            .color(self.colors.text_secondary)
+                            .size(14.0));
+                        let display_avg = format!("{:.0}", avg_calories);
+                        ui.add(egui::Label::new(
+                            RichText::new(display_avg)
+                                .color(self.colors.text_primary)
+                                .font(FontId::new(32.0, FontFamily::Proportional))
+                                .strong()
+                        ));
+                        ui.label(RichText::new("daily average calories")
+                            .color(self.colors.text_muted)
+                            .size(14.0));
+                        
+                        // Show target indicator
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            let target_text = format!("{:.0}% of target", target_achievement * 100.0);
+                            let target_color = if target_achievement <= 1.05 {
+                                self.colors.primary
+                            } else {
+                                self.colors.accent
+                            };
+                            let icon = if target_achievement <= 1.0 { "✓" } else { "!" };
+                            ui.label(RichText::new(icon).color(target_color).size(16.0));
+                            ui.label(RichText::new(target_text).color(target_color).strong());
+                        });
+                    });
+            });
+            
+            ui.add_space(16.0);
+            
+            // Middle Stats Group
+            ui.vertical(|ui| {
+                egui::Frame::none()
+                    .fill(self.colors.bg_light)
+                    .rounding(8.0)
+                    .inner_margin(egui::style::Margin::same(16.0))
+                    .show(ui, |ui| {
+                        ui.add_space(4.0);
+                        ui.label(RichText::new("TRACKING STATS")
+                            .color(self.colors.text_secondary)
+                            .size(14.0));
+                        ui.add(egui::Label::new(
+                            RichText::new(format!("{}", days_count))
+                                .color(self.colors.text_primary)
+                                .font(FontId::new(32.0, FontFamily::Proportional))
+                                .strong()
+                        ));
+                        ui.label(RichText::new("days tracked")
+                            .color(self.colors.text_muted)
+                            .size(14.0));
+                            
+                        // Tracking consistency stats  
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            let balance = days_count - days_over_target;
+                            let percent_on_target = if days_count > 0 {
+                                100.0 * balance as f32 / days_count as f32 
+                            } else { 
+                                0.0 
+                            };
+                            ui.label(RichText::new(format!("{:.0}%", percent_on_target))
+                                .color(self.colors.primary)
+                                .strong());
+                            ui.label(RichText::new("days within target").color(self.colors.text_secondary));
+                        });
+                    });
+            });
+            
+            ui.add_space(16.0);
+            
+            // Right Stats Group
+            ui.vertical(|ui| {
+                egui::Frame::none()
+                    .fill(self.colors.bg_light)
+                    .rounding(8.0)
+                    .inner_margin(egui::style::Margin::same(16.0))
+                    .show(ui, |ui| {
+                        ui.add_space(4.0);
+                        ui.label(RichText::new("PEAK VALUES")
+                            .color(self.colors.text_secondary)
+                            .size(14.0));
+                        ui.columns(2, |cols| {
+                            // Highest day column
+                            cols[0].vertical(|ui| {
+                                ui.add(egui::Label::new(
+                                    RichText::new(format!("{}", highest_day.1))
+                                        .color(self.colors.accent)
+                                        .font(FontId::new(24.0, FontFamily::Proportional))
+                                        .strong()
+                                ));
+                                ui.label(RichText::new("highest")
+                                    .color(self.colors.text_muted)
+                                    .size(14.0));
+                                ui.label(RichText::new(&highest_day.0)
+                                    .color(self.colors.text_secondary)
+                                    .size(14.0));
+                            });
+                            
+                            // Lowest day column
+                            cols[1].vertical(|ui| {
+                                let lowest_cal = if lowest_day.1 == u32::MAX { 0 } else { lowest_day.1 };
+                                ui.add(egui::Label::new(
+                                    RichText::new(format!("{}", lowest_cal))
+                                        .color(self.colors.primary)
+                                        .font(FontId::new(24.0, FontFamily::Proportional))
+                                        .strong()
+                                ));
+                                ui.label(RichText::new("lowest")
+                                    .color(self.colors.text_muted)
+                                    .size(14.0));
+                                ui.label(RichText::new(&lowest_day.0)
+                                    .color(self.colors.text_secondary)
+                                    .size(14.0));
+                            });
+                        });
+                    });
             });
         });
         
         ui.add_space(16.0);
         
-        // Daily calories trend chart
-        self.h2(ui, "Daily Calorie Trend");
-        
-        self.card_frame(ui, |ui| {
-            Plot::new("daily_calorie_plot")
-                .height(300.0)
-                .legend(egui::plot::Legend::default())
-                .include_y(0.0)
-                .show(ui, |plot_ui| {
-                    let points = self.insights_plot_data();
-                    let line = Line::new(points)
-                        .color(self.colors.primary)
-                        .name("Daily Calories")
-                        .width(3.0);
-                    plot_ui.line(line);
+        // Add nutrition insights section using cards in a grid
+        ui.horizontal(|ui| {
+            // Left panel - Estimated Macros
+            ui.vertical(|ui| {
+                ui.set_min_width(ui.available_width() / 2.0 - 10.0);
+                self.h2(ui, "Nutrition Distribution");
+                self.card_frame(ui, |ui| {
+                    // Since we don't track actual macros, we'll show a simple estimate
+                    // based on common macro ratios in typical diets
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(8.0);
+                        ui.label(RichText::new("Estimated Macronutrient Distribution")
+                            .color(self.colors.text_primary)
+                            .size(16.0));
+                        ui.add_space(8.0);
+                    });
+                    
+                    // Macro pie chart visualization (simulated with progress bars)
+                    ui.vertical(|ui| {
+                        // Protein: ~25%
+                        ui.label(RichText::new("Protein").strong());
+                        ui.horizontal(|ui| {
+                            ui.add(egui::ProgressBar::new(0.25)
+                                .text(format!("25% (est. {:.0}g)", avg_calories * 0.25 / 4.0)));
+                        });
+                        ui.add_space(8.0);
+                        
+                        // Carbs: ~50%
+                        ui.label(RichText::new("Carbohydrates").strong());
+                        ui.horizontal(|ui| {
+                            ui.add(egui::ProgressBar::new(0.50)
+                                .text(format!("50% (est. {:.0}g)", avg_calories * 0.50 / 4.0)));
+                        });
+                        ui.add_space(8.0);
+                        
+                        // Fat: ~25%
+                        ui.label(RichText::new("Fat").strong());
+                        ui.horizontal(|ui| {
+                            ui.add(egui::ProgressBar::new(0.25)
+                                .text(format!("25% (est. {:.0}g)", avg_calories * 0.25 / 9.0)));
+                        });
+                        
+                        ui.add_space(16.0);
+                        ui.separator();
+                        ui.add_space(8.0);
+                        ui.label(RichText::new("* Based on estimated distribution for a typical balanced diet")
+                            .color(self.colors.text_muted)
+                            .italics()
+                            .size(12.0));
+                    });
                 });
+            });
+            
+            ui.add_space(16.0);
+            
+            // Right panel - AI Recommendations
+            ui.vertical(|ui| {
+                ui.set_min_width(ui.available_width());
+                self.h2(ui, "Smart Insights");
+                self.card_frame(ui, |ui| {
+                    // Generate recommendations based on user's data
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(8.0);
+                        ui.label(RichText::new("Personalized Recommendations")
+                            .color(self.colors.text_primary)
+                            .size(16.0));
+                        ui.add_space(16.0);
+                    });
+                    
+                    // Simulated AI recommendations based on user's data
+                    let recommendations = if avg_calories > avg_target * 1.1 {
+                        vec![
+                            "Your calorie intake is consistently above your target. Consider adding more protein-rich foods to increase satiety.",
+                            "Try adding a 30-minute walk to your daily routine to help balance your caloric intake.",
+                            "Your highest calorie day was significantly above average. Identify what foods contributed most on that day."
+                        ]
+                    } else if avg_calories < avg_target * 0.9 {
+                        vec![
+                            "Your calorie intake is below your target. Consider adding healthy energy-dense foods like nuts or avocados.",
+                            "Make sure you're getting enough essential nutrients despite the lower calorie intake.",
+                            "Consider consulting with a nutrition professional if you're intentionally restricting calories."
+                        ]
+                    } else {
+                        vec![
+                            "Your calorie intake is well aligned with your targets. Keep up the good work!",
+                            "Consider diversifying your food choices to ensure balanced nutrient intake.",
+                            "Your consistent tracking is providing valuable insights into your nutrition patterns."
+                        ]
+                    };
+                    
+                    for (i, recommendation) in recommendations.iter().enumerate() {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(format!("{}.", i+1))
+                                .color(self.colors.accent)
+                                .strong());
+                            ui.label(RichText::new(*recommendation)
+                                .color(self.colors.text_primary));
+                        });
+                        ui.add_space(8.0);
+                    }
+                    
+                    ui.add_space(8.0);
+                    
+                    // Optional goal setting prompt at the bottom
+                    egui::Frame::none()
+                        .fill(self.colors.bg_dark)
+                        .inner_margin(egui::style::Margin::same(8.0))
+                        .rounding(4.0)
+                        .show(ui, |ui| {
+                            ui.label(RichText::new("💡 Pro Tip: Setting specific nutrition goals can increase success rate by up to 70%")
+                                .color(self.colors.accent_light)
+                                .size(14.0));
+                        });
+                });
+            });
         });
+    }
+    
+    /// Build data for the Insights plot from daily logs for current user only
+    fn user_insights_plot_data(&self) -> PlotPoints {
+        let mut points = Vec::new();
         
-        // Add more insights as needed
-        ui.add_space(16.0);
-        self.h2(ui, "Diet Composition");
+        // Filter dates for current user
+        let mut user_dates: Vec<&String> = self.dlogs.logs.keys()
+            .filter(|k| k.starts_with(&format!("{}:", self.current_user.username)))
+            .collect();
+            
+        user_dates.sort();
         
-        self.card_frame(ui, |ui| {
-            // This would be a good place to add macronutrient breakdowns or other dietary analytics
-            ui.label("This section will show macronutrient breakdowns and other dietary analytics");
-        });
+        for (i, date_key) in user_dates.iter().enumerate() {
+            if let Some(log) = self.dlogs.logs.get(*date_key) {
+                let total: u32 = log.entries.iter()
+                    .map(|e| self.calculate_food_calories(&e.food_id, e.servings))
+                    .sum();
+                points.push([i as f64, total as f64]);
+            }
+        }
+        
+        PlotPoints::from(points)
     }
 }
 
@@ -447,46 +795,33 @@ impl eframe::App for MyApp {
             ctx.set_style(style);
         }
         
-        // App header with navigation
-        egui::TopBottomPanel::top("header").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.add(egui::Label::new(
-                    RichText::new("NUTRITRACK")
-                        .font(FontId::new(22.0, FontFamily::Proportional))
-                        .color(self.colors.text_primary)
-                        .strong()
-                ));
-                
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    // Navigation menu
-                    for (idx, label) in [("Food Database", 0), ("Daily Logs", 1), ("Insights", 2)].iter() {
-                        if ui.add(egui::SelectableLabel::new(
-                            self.tab == *label,
-                            RichText::new(*idx).font(FontId::new(16.0, FontFamily::Proportional))
-                        )).clicked() {
-                            self.tab = *label;
-                        }
-                    }
-                });
-            });
-            ui.separator();
+        // Navigation panel on the left
+        SidePanel::left("side_panel").show(ctx, |ui| {
+            ui.heading("Menu");
+            if ui.selectable_label(self.selected_tab == Tab::FoodDatabase, "Food Database").clicked() {
+                self.selected_tab = Tab::FoodDatabase;
+            }
+            if ui.selectable_label(self.selected_tab == Tab::DailyLogs, "Daily Logs").clicked() {
+                self.selected_tab = Tab::DailyLogs;
+            }
+            if ui.selectable_label(self.selected_tab == Tab::Insights, "Insights").clicked() {
+                self.selected_tab = Tab::Insights;
+            }
         });
-
+        
         // Main content area
-        egui::CentralPanel::default().show(ctx, |ui| {
-            // Render content based on selected tab
-            match self.tab {
-                0 => self.render_food_database(ui),
-                1 => self.render_daily_logs(ui),
-                2 => self.render_insights(ui),
-                _ => {}
+        CentralPanel::default().show(ctx, |ui| {
+            match self.selected_tab {
+                Tab::FoodDatabase => self.render_food_database(ui),
+                Tab::DailyLogs => self.render_daily_logs(ui),
+                Tab::Insights => self.render_insights(ui),
             }
         });
     }
 }
 
-pub fn launch_gui(food_db: FoodDatabase, dlogs: DailyLogs) {
-    let app = MyApp::new(food_db, dlogs);
+pub fn launch_gui(food_db: FoodDatabase, dlogs: DailyLogs, user: User) {  // Updated to include user
+    let app = MyApp::new(food_db, dlogs, user);
     let options = eframe::NativeOptions {
         initial_window_size: Some(egui::vec2(1100.0, 700.0)),
         min_window_size: Some(egui::vec2(800.0, 600.0)),
