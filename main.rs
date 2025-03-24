@@ -2,11 +2,13 @@ use serde::{Serialize, Deserialize};
 use std::io::{self, Write};
 use std::fs;
 
-// Add this to import the daily_logs module and its commands.
+// Add this to import modules
 mod daily_logs;
-mod gui; // <-- new GUI module
-mod login; // new login module
-use daily_logs::{DailyLogs, daily_logs_menu};
+mod gui;
+mod login;
+mod calorie_calculator;  // NEW: calorie calculator module
+
+use daily_logs::DailyLogs;
 use gui::launch_gui;
 use login::login_page;
 
@@ -120,6 +122,19 @@ impl FoodDatabase {
         }
         Some(total)
     }
+
+    /// Calculate calories for a food with the given servings.
+    pub fn calculate_food_calories(&self, food_id: &str, servings: f32) -> u32 {
+        if let Some(basic) = self.basic_foods.iter().find(|b| b.id == food_id) {
+            return (basic.calories as f32 * servings) as u32;
+        }
+        if let Some(composite) = self.composite_foods.iter().find(|c| c.id == food_id) {
+            if let Some(cal) = self.compute_composite_calories(composite) {
+                return (cal as f32 * servings) as u32;
+            }
+        }
+        0
+    }
 }
 
 /// When adding a component to a composite food, check if a basic food with the given id exists.
@@ -159,8 +174,10 @@ fn ensure_basic_food_exists(db: &mut FoodDatabase, id: &str) -> String {
     };
     db.add_basic_food(food);
     println!("Basic food '{}' added.", id);
-    id.to_string()
+    id.to_string()  // Add explicit return statement
 }
+
+// ...existing code...
 
 fn main() {
     // First, ask user to login or signup.
@@ -177,10 +194,10 @@ fn main() {
     loop {
         println!("\nMain Menu:");
         println!("1. Food Database Menu");
-        println!("2. Daily Logs Menu");
+        println!("2. User Menu");  // Changed from "Daily Logs Menu" to "User Menu"
         println!("3. Save Food Database");
         println!("4. Save Daily Logs");
-        println!("5. Launch GUI");  // new option
+        println!("5. Launch GUI");
         println!("6. Exit");
         print!("Enter choice: ");
         io::stdout().flush().unwrap();
@@ -209,7 +226,7 @@ fn main() {
                     }
                 }
             },
-            "2" => daily_logs_menu(&mut dlogs, &db, &user), // Pass &db as second argument.
+            "2" => user_menu(&mut dlogs, &db, &user), // New function instead of daily_logs_menu
             "3" => {
                 match db.save_to_file(db_file) {
                     Ok(_) => println!("Food database saved successfully."),
@@ -223,8 +240,8 @@ fn main() {
                 }
             },
             "5" => {
-                // Launch GUI with the current databases.
-                launch_gui(db.clone(), dlogs.clone());
+                // Launch GUI with the current databases and user.
+                launch_gui(db.clone(), dlogs.clone(), user.clone());
             },
             "6" => {
                 let _ = db.save_to_file(db_file);
@@ -236,6 +253,146 @@ fn main() {
         }
     }
 }
+
+// New function for the User Menu
+fn user_menu(dlogs: &mut DailyLogs, db: &FoodDatabase, user: &login::User) {
+    loop {
+        println!("\nUser Menu for {}:", user.username);
+        println!("1. Daily Logs Menu");
+        println!("2. List All Log Entries");
+        println!("3. Change Calorie Calculation Method");
+        println!("4. Back to Main Menu");
+        print!("Enter choice: ");
+        io::stdout().flush().unwrap();
+
+        let mut choice = String::new();
+        io::stdin().read_line(&mut choice).unwrap();
+
+        match choice.trim() {
+            "1" => daily_logs::daily_logs_menu(dlogs, db, user),
+            "2" => list_user_log_dates(dlogs, user),
+            "3" => change_calorie_method(dlogs, user),
+            "4" => break,
+            _ => println!("Invalid choice."),
+        }
+    }
+}
+
+// Function to list all log dates for the current user
+fn list_user_log_dates(dlogs: &DailyLogs, user: &login::User) {
+    let mut user_dates: Vec<String> = dlogs.logs.keys()
+        .filter(|k| k.starts_with(&format!("{}:", user.username)))
+        .map(|k| k.split(':').nth(1).unwrap_or("").to_string())
+        .collect();
+    
+    if user_dates.is_empty() {
+        println!("No log entries found for user: {}", user.username);
+        return;
+    }
+
+    user_dates.sort();
+    user_dates.reverse(); // Most recent first
+    
+    println!("\nLog dates for user {}:", user.username);
+    for (i, date) in user_dates.iter().enumerate() {
+        let key = format!("{}:{}", user.username, date);
+        if let Some(log) = dlogs.logs.get(&key) {
+            let entry_count = log.entries.len();
+            let has_metrics = log.daily_info.is_some();
+            
+            print!("{}. {}: {} entries", i+1, date, entry_count);
+            if has_metrics {
+                print!(" (has metrics)");
+            }
+            println!();
+        }
+    }
+}
+
+// Function to change calorie calculation method for the user
+fn change_calorie_method(dlogs: &mut DailyLogs, user: &login::User) {
+    use calorie_calculator::{CalorieMethod, calculate_calorie_target};
+    
+    println!("Available Calculation Methods:");
+    for (i, (_method, description)) in CalorieMethod::all_methods().iter().enumerate() {
+        println!("{}. {}", i+1, description);
+    }
+    
+    print!("Select method (1-{}): ", CalorieMethod::all_methods().len());
+    io::stdout().flush().unwrap();
+    let mut method_choice = String::new();
+    io::stdin().read_line(&mut method_choice).unwrap();
+    
+    if let Ok(idx) = method_choice.trim().parse::<usize>() {
+        if idx > 0 && idx <= CalorieMethod::all_methods().len() {
+            let selected_method = CalorieMethod::all_methods()[idx-1].0.clone();
+            
+            println!("Apply this method to:");
+            println!("1. All future log entries");
+            println!("2. A specific date");
+            println!("3. Cancel");
+            
+            let mut scope_choice = String::new();
+            print!("Enter choice: ");
+            io::stdout().flush().unwrap();
+            io::stdin().read_line(&mut scope_choice).unwrap();
+            
+            match scope_choice.trim() {
+                "1" => {
+                    // Saved for all future entries
+                    println!("Calorie method set to {} for all future entries.", selected_method.name());
+                    // In a real app, you'd save this preference to the user profile
+                },
+                "2" => {
+                    // Apply to a specific date
+                    print!("Enter date (YYYY-MM-DD): ");
+                    io::stdout().flush().unwrap();
+                    let mut date = String::new();
+                    io::stdin().read_line(&mut date).unwrap();
+                    let date = date.trim();
+                    
+                    if daily_logs::validate_date(date) {
+                        let log = dlogs.get_log_mut_for_user(date, &user.username);
+                        
+                        // Create or update daily info with the selected method
+                        if let Some(info) = &mut log.daily_info {
+                            info.calorie_method = selected_method.clone();
+                        } else {
+                            log.daily_info = Some(daily_logs::DailyUserInfo {
+                                age: user.age,
+                                weight: user.weight,
+                                activity_level: user.activity_level.clone(),
+                                calorie_method: selected_method.clone(),
+                            });
+                        }
+                        
+                        // Calculate and display the new target
+                        let target = calculate_calorie_target(
+                            &selected_method,
+                            &user.gender,
+                            log.daily_info.as_ref().unwrap().weight,
+                            user.height,
+                            log.daily_info.as_ref().unwrap().age,
+                            &log.daily_info.as_ref().unwrap().activity_level
+                        );
+                        
+                        println!("Calorie method for {} changed to: {}", date, selected_method.name());
+                        println!("New calorie target: {} calories", target);
+                    } else {
+                        println!("Invalid date format. Please use YYYY-MM-DD.");
+                    }
+                },
+                _ => println!("Operation canceled."),
+            }
+        } else {
+            println!("Invalid selection.");
+        }
+    } else {
+        println!("Invalid input.");
+    }
+}
+
+// ...existing code...
 
 fn add_basic_food_cli(db: &mut FoodDatabase) {
     let mut id = String::new();
